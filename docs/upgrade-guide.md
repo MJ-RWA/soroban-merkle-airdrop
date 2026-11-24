@@ -21,11 +21,12 @@ network protocol, the host ABI may change in ways that require a new SDK. A
 contract compiled against an old SDK may refuse to deploy, or may fail at
 runtime, on a network that has moved to a newer protocol version.
 
-**Every SDK upgrade requires a new WASM deployment.** The compiled WASM is
-what lives on-chain; updating `Cargo.toml` and rebuilding is not enough on its
-own — the new binary must be uploaded and a new contract instance deployed (or
-the existing one upgraded with `update_current_contract_wasm`, which this
-contract does not support).
+**Every SDK upgrade requires new WASM on-chain.** The compiled WASM is what
+lives on-chain; updating `Cargo.toml` and rebuilding is not enough on its own —
+the new binary must be uploaded. It can then either be applied to the existing
+contract with the admin-only `upgrade()` entry point (see
+[Contract WASM upgrade](#contract-wasm-upgrade)) or deployed as a new contract
+instance.
 
 ---
 
@@ -125,6 +126,128 @@ commands or default addresses have changed.
 
 ---
 
+## Contract WASM upgrade
+
+A deployed airdrop can replace its own WASM in place: the admin-only
+`upgrade(new_wasm_hash)` entry point in
+[`contracts/airdrop/src/lib.rs`](../contracts/airdrop/src/lib.rs) calls
+`update_current_contract_wasm`. The contract address, admin, Merkle root, token
+address, and all claim state are preserved. This is distinct from the SDK
+version procedure above, which describes rebuilding from source; use this
+runbook when the goal is to ship a fixed or optimized binary to an **already
+deployed** contract.
+
+### 1. When to use
+
+- Bug fixes, gas optimizations, and compatible SDK bumps that keep the same
+  contract interface and storage keys.
+- Do **not** use it for ABI-breaking changes (renamed or removed functions,
+  changed argument or event shapes) or for storage-layout changes. In those
+  cases deploy a new contract instance instead, as described in
+  [Step 6](#6-deploy-the-new-wasm), and initialize it with a fresh Merkle root
+  (see the
+  [same-network re-deployment replay note](./threat-model.md#9-same-network-re-deployment-replay-attack)).
+
+### 2. Preparation
+
+- Make sure the current admin key is available and can sign. `upgrade()` calls
+  `admin.require_auth()`.
+- **Pause the contract first** so claims cannot land during the upgrade
+  window:
+
+  ```bash
+  stellar contract invoke \
+    --network <network> \
+    --source admin \
+    --id "$CONTRACT_ID" \
+    -- set_active --active false
+  ```
+
+- Record the current WASM hash and the `contract_info()` output as a rollback
+  reference. Keep the old WASM file so the previous hash can be uploaded again
+  if needed.
+
+### 3. Build new WASM
+
+```bash
+cargo build \
+  --manifest-path contracts/airdrop/Cargo.toml \
+  --target wasm32v1-none \
+  --release
+```
+
+Run the test suite (`cargo test --manifest-path contracts/airdrop/Cargo.toml`)
+before uploading. The artifact is
+`target/wasm32v1-none/release/soroban_merkle_airdrop.wasm`.
+
+### 4. Upload new WASM
+
+```bash
+stellar contract upload \
+  --network <network> \
+  --source admin \
+  --wasm target/wasm32v1-none/release/soroban_merkle_airdrop.wasm
+```
+
+Capture the `<NEW_WASM_HASH>` printed by the command.
+
+### 5. Execute upgrade
+
+```bash
+stellar contract invoke \
+  --network <network> \
+  --source admin \
+  --id "$CONTRACT_ID" \
+  -- upgrade --new_wasm_hash <NEW_WASM_HASH>
+```
+
+The admin must authorize the call. On success an `("upgrade", admin)` event
+with the new hash is emitted, so indexers can detect the change. The upgrade is
+immediate — there is no staged upgrade or time-lock.
+
+### 6. Verify
+
+Confirm the new WASM hash is active using an explorer or the contract's ledger
+entry, and check that state is unchanged with `contract_info()`:
+
+```bash
+stellar contract invoke --network <network> --id "$CONTRACT_ID" -- contract_info
+```
+
+`contract_info()` returns `admin`, `token`, `merkle_root`, `total_deposited`,
+`active`, and `expiration` — all of these should be unchanged (including
+`active: false`). Claimed flags are unchanged too; verify one with
+`is_claimed()`. On testnet, exercise a claim from an unclaimed address before
+unpausing on mainnet.
+
+### 7. Unpause
+
+```bash
+stellar contract invoke \
+  --network <network> \
+  --source admin \
+  --id "$CONTRACT_ID" \
+  -- set_active --active true
+```
+
+Confirm `is_active()` returns `true` and monitor the first claims and the
+`("upgrade", admin)` / `("paused", admin)` events.
+
+### 8. Caveats
+
+- Storage keys must be backward compatible. Every entry written by the old
+  WASM must still be readable with the same `DataKey` variants and types;
+  claimed entries and the Merkle root must not be lost.
+- ABI-breaking changes require redeployment — do not point an in-place upgrade
+  at a binary whose function signatures or event topics changed, because
+  existing clients and indexers will break.
+- The upgrade is immediate and has no time-lock, so pause first and use a
+  rehearsal on testnet.
+- Verify on testnet before mainnet, and record the new hash, SDK version, and
+  timestamp in the deployment log.
+
+---
+
 ## Known breaking changes by version
 
 ### Upgrading from 20.x to 21.x
@@ -163,17 +286,21 @@ Watch for:
 
 ---
 
-## Operational reminder: new WASM = new deployment
+## Operational reminder: in-place upgrade vs. new deployment
 
-There is no `update_current_contract_wasm` entry point in this contract, so
-an SDK upgrade cannot be applied to a running contract in-place. Every upgrade
-means:
+The contract does expose `update_current_contract_wasm` through the admin-only
+`upgrade()` entry point, so a compatible upgrade can be applied in place (see
+[Contract WASM upgrade](#contract-wasm-upgrade)). That keeps the contract
+address, Merkle root, and claim state intact.
 
-1. A new WASM hash on-chain.
-2. A new contract address (or a separate upgrade proxy, not implemented here).
-3. A new Merkle root (required by the replay-protection policy).
-4. New token deposits into the new contract.
-5. Communication to all recipients about the new contract address.
+A **new deployment** is still required when the ABI or storage layout changes.
+It means:
 
-Plan upgrades well before mainnet deployment to avoid forcing recipient
-re-notification. On testnet, upgrades are cheap — test freely.
+1. A new contract address.
+2. A new Merkle root (required by the replay-protection policy).
+3. New token deposits into the new contract.
+4. Communication to all recipients about the new contract address.
+5. Pausing or retiring the old contract.
+
+Plan breaking upgrades well before mainnet deployment to avoid forcing
+recipient re-notification. On testnet, upgrades are cheap — test freely.
