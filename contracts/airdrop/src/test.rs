@@ -1195,9 +1195,33 @@ fn test_leaf_hash_known_vector() {
 
 // ─── Issue #23: transfer_admin ─────────────────────────────────────────────
 
-/// Successful admin transfer: admin() reflects new owner and the event is emitted.
+/// Successful admin transfer updates the stored admin.
 #[test]
-fn test_transfer_admin_success() {
+fn test_transfer_admin_changes_admin() {
+    let (env, admin, token, contract_id) = setup();
+    let client = AirdropContractClient::new(&env, &contract_id);
+    let claimant = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    let (root, _, _) = build_two_leaf_tree(&env, &contract_id, &claimant, 1000, &admin, 500);
+    mint(&env, &token, &admin, &admin, 1500);
+    client.initialize(
+        &admin,
+        &token,
+        &root,
+        &1500,
+        &DEFAULT_EXPIRATION,
+        &None,
+        &None,
+    );
+
+    client.transfer_admin(&new_admin);
+    assert_eq!(client.admin(), Some(new_admin.clone()));
+}
+
+/// Admin transfer emits the old and new admin addresses in the event.
+#[test]
+fn test_transfer_admin_emits_event() {
     let (env, admin, token, contract_id) = setup();
     let client = AirdropContractClient::new(&env, &contract_id);
     let claimant = Address::generate(&env);
@@ -1217,10 +1241,6 @@ fn test_transfer_admin_success() {
 
     client.transfer_admin(&new_admin);
     let transfer_events = contract_events(&env, &contract_id);
-
-    // admin() must now return the new admin.
-    assert_eq!(client.admin(), Some(new_admin.clone()));
-
     assert_eq!(
         transfer_events,
         expected_events(
@@ -1238,7 +1258,7 @@ fn test_transfer_admin_success() {
 /// Non-admin calling transfer_admin must panic (auth failure).
 #[test]
 #[should_panic]
-fn test_non_admin_transfer_admin_fails() {
+fn test_transfer_admin_non_admin_fails() {
     let (env, admin, token, contract_id) = setup();
     let client = AirdropContractClient::new(&env, &contract_id);
     let claimant = Address::generate(&env);
@@ -1272,9 +1292,46 @@ fn test_non_admin_transfer_admin_fails() {
     client.transfer_admin(&new_admin);
 }
 
-/// After a transfer, the new admin can call set_active; the old admin cannot.
+/// After a transfer, the old admin can no longer call set_active.
 #[test]
-fn test_new_admin_can_set_active() {
+#[should_panic]
+fn test_transfer_admin_old_admin_loses_rights() {
+    let (env, admin, token, contract_id) = setup();
+    let client = AirdropContractClient::new(&env, &contract_id);
+    let claimant = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    let (root, _, _) = build_two_leaf_tree(&env, &contract_id, &claimant, 1000, &admin, 500);
+    mint(&env, &token, &admin, &admin, 1500);
+    client.initialize(
+        &admin,
+        &token,
+        &root,
+        &1500,
+        &DEFAULT_EXPIRATION,
+        &None,
+        &None,
+    );
+
+    client.transfer_admin(&new_admin);
+
+    env.set_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "set_active",
+            args: (false,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }
+    .into()]);
+
+    client.set_active(&false);
+}
+
+/// After a transfer, the new admin can call set_active.
+#[test]
+fn test_transfer_admin_new_admin_has_rights() {
     let (env, admin, token, contract_id) = setup();
     let client = AirdropContractClient::new(&env, &contract_id);
     let claimant = Address::generate(&env);
