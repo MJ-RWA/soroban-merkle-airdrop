@@ -64,6 +64,10 @@ soroban-merkle-airdrop/
     └── deploy.yml              # Manual deploy to testnet/mainnet
 ```
 
+## SDK Quick Start
+
+For a complete walkthrough of tree generation, proof verification, contract queries, Node.js claims, and the Freighter browser-wallet flow, see the [SDK Quick Start](docs/sdk-quickstart.md).
+
 ## API Reference
 
 Full TypeDoc-generated API reference for the TypeScript SDK:
