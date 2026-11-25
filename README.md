@@ -120,6 +120,8 @@ Available environment variables for the event streamer:
 
 ## SDK Installation
 
+For a complete walkthrough of tree generation, proof verification, contract queries, claims, and Freighter wallet signing, see the [SDK Quick Start](docs/sdk-quickstart.md).
+
 Install the TypeScript SDK into your project:
 
 ```bash
